@@ -5,8 +5,7 @@
 
 use futures_io::{AsyncBufRead, AsyncRead, AsyncWrite};
 use std::{
-    fmt,
-    io,
+    fmt, io,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -23,7 +22,18 @@ const DEFAULT_CHUNK_COUNT: usize = 4;
 /// either the entire slice is written at once or not at all. Slices will never
 /// be partially written.
 pub fn pipe() -> (PipeReader, PipeWriter) {
-    let (reader, writer) = chunked::new(DEFAULT_CHUNK_COUNT);
+    let (reader, writer) = chunked::new(DEFAULT_CHUNK_COUNT, None, None);
+
+    (PipeReader { inner: reader }, PipeWriter { inner: writer })
+}
+
+/// Creates a new asynchronous pipe that returns BrokenPipe after configured
+/// interval.
+pub fn pipe_test_broken(
+    reader_fail_every: Option<usize>,
+    writer_fail_every: Option<usize>,
+) -> (PipeReader, PipeWriter) {
+    let (reader, writer) = chunked::new(DEFAULT_CHUNK_COUNT, reader_fail_every, writer_fail_every);
 
     (PipeReader { inner: reader }, PipeWriter { inner: writer })
 }

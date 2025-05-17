@@ -20,7 +20,7 @@
 //! that happen during reads and writes are occasional reallocation for each
 //! individual vector to fit larger chunks of bytes that don't already fit.
 
-use async_channel::{bounded, Sender, Receiver};
+use async_channel::{bounded, Receiver, Sender};
 use futures_core::{FusedStream, Stream};
 use futures_io::{AsyncBufRead, AsyncRead, AsyncWrite};
 use std::{
@@ -28,6 +28,7 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
+use tracing::debug;
 
 /// Create a new chunked pipe with room for a fixed number of chunks.
 ///
@@ -40,7 +41,11 @@ use std::{
 /// If `count` is set to 1, then the pipe is essentially serial, since only the
 /// reader or writer can operate on the single buffer at one time and cannot be
 /// run in parallel.
-pub(crate) fn new(count: usize) -> (Reader, Writer) {
+pub(crate) fn new(
+    count: usize,
+    reader_fail_every: Option<usize>,
+    writer_fail_every: Option<usize>,
+) -> (Reader, Writer) {
     let (buf_pool_tx, buf_pool_rx) = bounded(count);
     let (buf_stream_tx, buf_stream_rx) = bounded(count);
 
@@ -55,11 +60,15 @@ pub(crate) fn new(count: usize) -> (Reader, Writer) {
         buf_pool_tx,
         buf_stream_rx: Box::pin(buf_stream_rx),
         chunk: None,
+        fail_every: reader_fail_every.clone(),
+        fail_counter: reader_fail_every.unwrap_or(0),
     };
 
     let writer = Writer {
         buf_pool_rx: Box::pin(buf_pool_rx),
         buf_stream_tx,
+        fail_every: writer_fail_every.clone(),
+        fail_counter: writer_fail_every.unwrap_or(0),
     };
 
     (reader, writer)
@@ -75,6 +84,10 @@ pub(crate) struct Reader {
 
     /// A chunk currently being read from.
     chunk: Option<Cursor<Vec<u8>>>,
+
+    // Test failures
+    fail_every: Option<usize>,
+    fail_counter: usize,
 }
 
 impl AsyncRead for Reader {
@@ -105,6 +118,15 @@ impl AsyncRead for Reader {
 
 impl AsyncBufRead for Reader {
     fn poll_fill_buf(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        // Check if it's time to break
+        if let Some(fail_every) = self.fail_every {
+            self.fail_counter -= 1;
+            if self.fail_counter == 0 {
+                self.fail_counter = fail_every;
+                debug!("Test BrokenPipe");
+                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+            }
+        }
         // If the current chunk is consumed, first return it to the writer for
         // reuse.
         if let Some(chunk) = self.chunk.as_ref() {
@@ -127,6 +149,7 @@ impl AsyncBufRead for Reader {
                     }
                     // Some other error occurred.
                     else {
+                        debug!("BrokenPipe, read error: {e}");
                         return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
                     }
                 }
@@ -173,6 +196,7 @@ impl Drop for Reader {
         // Ensure we close the primary stream first before the pool stream so
         // that the writer knows the pipe is closed before trying to poll the
         // pool channel.
+        debug!("close, reader drop");
         self.buf_stream_rx.close();
         self.buf_pool_tx.close();
     }
@@ -185,6 +209,10 @@ pub(crate) struct Writer {
 
     /// A channel of incoming buffers to write chunks to.
     buf_stream_tx: Sender<Cursor<Vec<u8>>>,
+
+    // Test failures
+    fail_every: Option<usize>,
+    fail_counter: usize,
 }
 
 impl AsyncWrite for Writer {
@@ -197,6 +225,7 @@ impl AsyncWrite for Writer {
         // otherwise we'd be spending time writing the entire buffer only to
         // discover that it is closed afterward.
         if self.buf_stream_tx.is_closed() {
+            debug!("BrokenPipe, write buf_stream_tx.is_closed()");
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
 
@@ -211,13 +240,25 @@ impl AsyncWrite for Writer {
             Poll::Pending => Poll::Pending,
 
             // Pipe has closed.
-            Poll::Ready(None) => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+            Poll::Ready(None) => {
+                debug!("BrokenPipe, write pipe closed");
+                Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+            }
 
             // An available buffer has been found.
             Poll::Ready(Some(mut chunk)) => {
                 // Write the buffer to the chunk.
                 chunk.get_mut().extend_from_slice(buf);
 
+                // Check if it's time to break
+                if let Some(fail_every) = self.fail_every {
+                    self.fail_counter -= 1;
+                    if self.fail_counter == 0 {
+                        self.fail_counter = fail_every;
+                        debug!("Test BrokenPipe");
+                        return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+                    }
+                }
                 // Send the chunk to the reader.
                 match self.buf_stream_tx.try_send(chunk) {
                     Ok(()) => Poll::Ready(Ok(buf.len())),
@@ -226,6 +267,7 @@ impl AsyncWrite for Writer {
                         if e.is_full() {
                             panic!("buffer pool overflow")
                         } else {
+                            debug!("BrokenPipe, write error: {e}");
                             Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
                         }
                     }
@@ -239,6 +281,7 @@ impl AsyncWrite for Writer {
     }
 
     fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        debug!("close because of write poll_close");
         self.buf_stream_tx.close();
         Poll::Ready(Ok(()))
     }

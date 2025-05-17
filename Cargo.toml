@@ -1,5 +1,5 @@
 [package]
-name = "sluice"
+name = "sluice-test"
 version = "0.5.5"
 authors = ["Stephen M. Coakley <me@stephencoakley.com>"]
 edition = "2021"
@@ -16,6 +16,7 @@ rust-version = "1.74"
 async-channel = "2"
 futures-core = "0.3"
 futures-io = "0.3"
+tracing = "0.1"
 
 [dev-dependencies]
 criterion = "0.5"
